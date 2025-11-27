@@ -1,4 +1,4 @@
-import { ChatMessage, CountryData, Coordinates } from "../types";
+import { CountryData, Coordinates, ChatMessage } from "../types";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.API_KEY;
 const OPENAI_MODEL = "gpt-4o";
@@ -36,6 +36,7 @@ const callOpenAI = async (body: Record<string, any>): Promise<any> => {
 
 // ---------------------------------------------------------------------
 // Country details (structured JSON) using GPT-4o
+// NOW includes famousPeople with links
 // ---------------------------------------------------------------------
 
 export const getCountryDetailsByName = async (
@@ -54,21 +55,28 @@ export const getCountryDetailsByName = async (
       content: `
 The user has selected "${countryName}" on a 3D globe.
 
-Return ONLY a single JSON object with exactly the following fields:
+Return ONLY a single JSON object with EXACTLY these fields:
 - flagEmoji: string (the emoji flag for the country)
 - capital: string (capital city)
 - population: string (approximate population, human-readable, e.g., "67 million")
 - description: string (a catchy, engaging 2-sentence intro for a tourist)
 - touristSites: array of exactly 4 strings (top tourist attractions)
+- famousPeople: array of exactly 5 objects, each object:
+  - name: string
+  - knownFor: string (short: why they're famous)
+  - link: string (a working HTTPS link; prefer Wikipedia page for reliability)
 
-Do NOT include any markdown, backticks, or extra text. Just a raw JSON object.
+Rules:
+- Do NOT include markdown, backticks, comments, or extra keys.
+- Links must be valid-looking HTTPS URLs (prefer https://en.wikipedia.org/wiki/...).
+- Keep names globally recognizable and relevant to ${countryName}.
 `,
     };
 
     const data = await callOpenAI({
       messages: [systemMessage, userMessage],
       temperature: 0.7,
-      max_tokens: 600,
+      max_tokens: 700,
       response_format: { type: "json_object" },
     });
 
@@ -77,31 +85,53 @@ Do NOT include any markdown, backticks, or extra text. Just a raw JSON object.
 
     const parsed = JSON.parse(content);
 
-    return {
+    // Defensive normalization (keeps app resilient)
+    const touristSites: string[] = Array.isArray(parsed.touristSites)
+      ? parsed.touristSites.filter(Boolean).slice(0, 4)
+      : [];
+
+    const famousPeople = Array.isArray(parsed.famousPeople)
+      ? parsed.famousPeople
+          .filter((p: any) => p && typeof p === "object")
+          .slice(0, 5)
+          .map((p: any) => ({
+            name: String(p.name ?? "").trim(),
+            knownFor: String(p.knownFor ?? "").trim(),
+            link: String(p.link ?? "").trim(),
+          }))
+          .filter((p: any) => p.name && p.link)
+      : [];
+
+    // NOTE:
+    // If your CountryData type does NOT yet include `famousPeople`,
+    // this cast keeps the build working until you extend types.ts and the UI.
+    return ({
       name: countryName,
       flagEmoji: parsed.flagEmoji,
       capital: parsed.capital,
       description: parsed.description,
       population: parsed.population,
-      touristSites: parsed.touristSites,
+      touristSites,
+      famousPeople,
       coordinates: coords,
-    };
+    } as unknown) as CountryData;
   } catch (error) {
     console.error("Error fetching country details:", error);
-    return {
+    return ({
       name: countryName,
       flagEmoji: "🏳️",
       capital: "Unknown",
       description: "Could not load details at this time.",
       population: "Unknown",
       touristSites: [],
+      famousPeople: [],
       coordinates: coords,
-    };
+    } as unknown) as CountryData;
   }
 };
 
 // ---------------------------------------------------------------------
-// TRUE streaming (token-by-token) using GPT-4o via SSE (Chat Completions)
+// TRUE streaming (token-by-token) using GPT-4o via SSE
 // ---------------------------------------------------------------------
 
 export const createChatStream = async (
@@ -149,7 +179,7 @@ Use clear markdown when helpful (bullet points, short paragraphs).
         model: OPENAI_MODEL,
         messages: [systemMessage, ...historyMessages, userMessage],
         temperature: 0.8,
-        max_tokens: 350,
+        max_tokens: 300,
         stream: true,
       }),
     });
@@ -204,126 +234,4 @@ Use clear markdown when helpful (bullet points, short paragraphs).
     console.error("Chat stream error:", error);
     onChunk("I'm having trouble connecting to the travel network. Please try again.");
   }
-};
-
-// ---------------------------------------------------------------------
-// Bar-race data generator (AI returns frames: year -> top countries + value)
-// ---------------------------------------------------------------------
-
-export type BarRaceRow = { country: string; value: number };
-export type BarRaceFrame = { year: number; rows: BarRaceRow[] };
-export type BarRacePayload = {
-  title: string;
-  metric: string;              // e.g. "Life expectancy"
-  unit: string;                // e.g. "years"
-  scope: "world" | "continent";
-  continent?: string;
-  topN: number;                // e.g. 10
-  updateFrequencyMs: number;   // e.g. 1800
-  frames: BarRaceFrame[];      // sorted by year ascending
-  note?: string;               // optional note
-};
-
-export const generateBarRacePayload = async (
-  userQuery: string,
-  countryContext: CountryData
-): Promise<BarRacePayload> => {
-  const systemMessage = {
-    role: "system" as const,
-    content: `
-You are a data analyst + visualization engineer.
-You must output STRICT JSON only (no markdown).
-You generate a bar-race dataset over YEARS for countries, based on the user's request.
-
-Rules:
-- If the user asks for "continent", limit to that continent; otherwise default to world.
-- If the user asks for a year range, use it; otherwise choose a reasonable range (at least 8 years).
-- topN must be between 5 and 15 (default 10).
-- Values must be numeric (floats allowed).
-- Frames must be sorted by year ascending.
-- Each frame.rows must have exactly topN rows and be sorted DESC by value.
-- Include a short "note" if data is approximate or synthesized.
-`.trim(),
-  };
-
-  const userMessage = {
-    role: "user" as const,
-    content: `
-Selected country context: ${countryContext.name}
-
-User request:
-"${userQuery}"
-
-Return ONLY a JSON object with EXACTLY these fields:
-{
-  "title": string,
-  "metric": string,
-  "unit": string,
-  "scope": "world" | "continent",
-  "continent": string | undefined,
-  "topN": number,
-  "updateFrequencyMs": number,
-  "frames": [
-     { "year": number, "rows": [ { "country": string, "value": number } ] }
-  ],
-  "note": string | undefined
-}
-
-No extra keys.
-`.trim(),
-  };
-
-  const data = await callOpenAI({
-    messages: [systemMessage, userMessage],
-    temperature: 0.35,
-    max_tokens: 1200,
-    response_format: { type: "json_object" },
-  });
-
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content || typeof content !== "string") {
-    throw new Error("No JSON returned for bar-race payload.");
-  }
-
-  const parsed = JSON.parse(content);
-
-  // light normalization/guardrails
-  const topN = Math.min(15, Math.max(5, Number(parsed.topN ?? 10)));
-  const updateFrequencyMs = Math.min(4000, Math.max(500, Number(parsed.updateFrequencyMs ?? 1800)));
-
-  const frames: BarRaceFrame[] = Array.isArray(parsed.frames)
-    ? parsed.frames
-        .map((f: any) => ({
-          year: Number(f.year),
-          rows: Array.isArray(f.rows)
-            ? f.rows
-                .map((r: any) => ({
-                  country: String(r.country ?? "").trim(),
-                  value: Number(r.value),
-                }))
-                .filter((r: any) => r.country && Number.isFinite(r.value))
-                .slice(0, topN)
-            : [],
-        }))
-        .filter((f: any) => Number.isFinite(f.year) && f.rows.length)
-        .sort((a: any, b: any) => a.year - b.year)
-    : [];
-
-  // ensure each frame has exactly topN rows (best-effort)
-  const fixedFrames = frames.map((f) => {
-    const rows = [...f.rows].sort((a, b) => b.value - a.value).slice(0, topN);
-    return { ...f, rows };
-  });
-
-  return {
-    title: String(parsed.title ?? "Country Bar Race"),
-    metric: String(parsed.metric ?? "Metric"),
-    unit: String(parsed.unit ?? ""),
-    scope: parsed.scope === "continent" ? "continent" : "world",
-    continent: parsed.scope === "continent" ? String(parsed.continent ?? "").trim() : undefined,
-    topN,
-    updateFrequencyMs,
-    frames: fixedFrames,
-    note: parsed.note ? String(parsed.note) : undefined,
-  };
 };
