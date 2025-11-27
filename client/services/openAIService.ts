@@ -5,11 +5,11 @@ const OPENAI_MODEL = "gpt-4o";
 
 const OPENAI_BASE_URL = "https://api.openai.com/v1/chat/completions";
 
-const callOpenAI = async (
-  body: Record<string, any>
-): Promise<any> => {
+const callOpenAI = async (body: Record<string, any>): Promise<any> => {
   if (!OPENAI_API_KEY) {
-    throw new Error("OpenAI API key not found. Please set OPENAI_API_KEY (or API_KEY) in your environment.");
+    throw new Error(
+      "OpenAI API key not found. Please set OPENAI_API_KEY (or API_KEY) in your environment."
+    );
   }
 
   const response = await fetch(OPENAI_BASE_URL, {
@@ -26,7 +26,9 @@ const callOpenAI = async (
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(`OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
+    throw new Error(
+      `OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`
+    );
   }
 
   return response.json();
@@ -99,7 +101,7 @@ Do NOT include any markdown, backticks, or extra text. Just a raw JSON object.
 };
 
 // ---------------------------------------------------------------------
-// Chat stream using GPT-4o (interface unchanged)
+// TRUE streaming (token-by-token) using GPT-4o via SSE
 // ---------------------------------------------------------------------
 
 export const createChatStream = async (
@@ -109,6 +111,12 @@ export const createChatStream = async (
   onChunk: (text: string) => void
 ) => {
   try {
+    if (!OPENAI_API_KEY) {
+      throw new Error(
+        "OpenAI API key not found. Please set OPENAI_API_KEY (or API_KEY) in your environment."
+      );
+    }
+
     const systemMessage = {
       role: "system" as const,
       content: `
@@ -120,6 +128,7 @@ Use clear markdown when helpful (bullet points, short paragraphs).
       `.trim(),
     };
 
+    // Map your app's roles to OpenAI roles
     const historyMessages = history.map((msg) => ({
       role: msg.role === "user" ? ("user" as const) : ("assistant" as const),
       content: msg.text,
@@ -130,20 +139,70 @@ Use clear markdown when helpful (bullet points, short paragraphs).
       content: newMessage,
     };
 
-    const data = await callOpenAI({
-      messages: [systemMessage, ...historyMessages, userMessage],
-      temperature: 0.8,
-      max_tokens: 300,
-      // We keep stream: false and push the full response through onChunk
-      // to preserve the same interface without changing the rest of the app.
-      stream: false,
+    const response = await fetch(OPENAI_BASE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [systemMessage, ...historyMessages, userMessage],
+        temperature: 0.8,
+        max_tokens: 300,
+        stream: true,
+      }),
     });
 
-    const content = data?.choices?.[0]?.message?.content ?? "";
-    if (content) {
-      onChunk(content);
-    } else {
-      onChunk("I'm having trouble responding right now. Please try again.");
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(
+        `OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`
+      );
+    }
+
+    if (!response.body) {
+      throw new Error("Streaming not supported (no response body).");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE events are separated by a blank line
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+
+      for (const evt of events) {
+        const lines = evt
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+
+          const dataStr = line.replace(/^data:\s*/, "");
+          if (dataStr === "[DONE]") return;
+
+          try {
+            const json = JSON.parse(dataStr);
+
+            // Chat Completions streaming: choices[0].delta.content
+            const delta = json?.choices?.[0]?.delta?.content;
+            if (delta) onChunk(delta);
+          } catch {
+            // Ignore malformed JSON from partial frames (rare with the buffer logic above)
+          }
+        }
+      }
     }
   } catch (error) {
     console.error("Chat stream error:", error);
