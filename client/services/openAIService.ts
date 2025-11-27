@@ -1,4 +1,4 @@
-import { ChatMessage, CountryData, Coordinates } from "../../types";
+import { CountryData, Coordinates, ChatMessage } from "../types";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.API_KEY;
 const OPENAI_MODEL = "gpt-4o";
@@ -36,6 +36,7 @@ const callOpenAI = async (body: Record<string, any>): Promise<any> => {
 
 // ---------------------------------------------------------------------
 // Country details (structured JSON) using GPT-4o
+// NOW includes famousPeople with links
 // ---------------------------------------------------------------------
 
 export const getCountryDetailsByName = async (
@@ -46,7 +47,7 @@ export const getCountryDetailsByName = async (
     const systemMessage = {
       role: "system" as const,
       content:
-        "You are a world-class travel expert. Provide accurate, engaging tourist data in strict JSON format.",
+        "You are a world-class travel expert. Provide accurate, engaging tourist data in strict JSON format. Do not output any text outside JSON.",
     };
 
     const userMessage = {
@@ -54,21 +55,28 @@ export const getCountryDetailsByName = async (
       content: `
 The user has selected "${countryName}" on a 3D globe.
 
-Return ONLY a single JSON object with exactly the following fields:
+Return ONLY a single JSON object with EXACTLY these fields:
 - flagEmoji: string (the emoji flag for the country)
 - capital: string (capital city)
 - population: string (approximate population, human-readable, e.g., "67 million")
 - description: string (a catchy, engaging 2-sentence intro for a tourist)
 - touristSites: array of exactly 4 strings (top tourist attractions)
+- famousPeople: array of exactly 5 objects, each object:
+  - name: string
+  - knownFor: string (short: why they're famous)
+  - link: string (a working HTTPS link; prefer Wikipedia page for reliability)
 
-Do NOT include any markdown, backticks, or extra text. Just a raw JSON object.
+Rules:
+- Do NOT include markdown, backticks, comments, or extra keys.
+- Links must be valid-looking HTTPS URLs (prefer https://en.wikipedia.org/wiki/...).
+- Keep names globally recognizable and relevant to ${countryName}.
 `,
     };
 
     const data = await callOpenAI({
       messages: [systemMessage, userMessage],
       temperature: 0.7,
-      max_tokens: 500,
+      max_tokens: 700,
       response_format: { type: "json_object" },
     });
 
@@ -77,26 +85,48 @@ Do NOT include any markdown, backticks, or extra text. Just a raw JSON object.
 
     const parsed = JSON.parse(content);
 
-    return {
+    // Defensive normalization (keeps app resilient)
+    const touristSites: string[] = Array.isArray(parsed.touristSites)
+      ? parsed.touristSites.filter(Boolean).slice(0, 4)
+      : [];
+
+    const famousPeople = Array.isArray(parsed.famousPeople)
+      ? parsed.famousPeople
+          .filter((p: any) => p && typeof p === "object")
+          .slice(0, 5)
+          .map((p: any) => ({
+            name: String(p.name ?? "").trim(),
+            knownFor: String(p.knownFor ?? "").trim(),
+            link: String(p.link ?? "").trim(),
+          }))
+          .filter((p: any) => p.name && p.link)
+      : [];
+
+    // NOTE:
+    // If your CountryData type does NOT yet include `famousPeople`,
+    // this cast keeps the build working until you extend types.ts and the UI.
+    return ({
       name: countryName,
       flagEmoji: parsed.flagEmoji,
       capital: parsed.capital,
       description: parsed.description,
       population: parsed.population,
-      touristSites: parsed.touristSites,
+      touristSites,
+      famousPeople,
       coordinates: coords,
-    };
+    } as unknown) as CountryData;
   } catch (error) {
     console.error("Error fetching country details:", error);
-    return {
+    return ({
       name: countryName,
       flagEmoji: "🏳️",
       capital: "Unknown",
       description: "Could not load details at this time.",
       population: "Unknown",
       touristSites: [],
+      famousPeople: [],
       coordinates: coords,
-    };
+    } as unknown) as CountryData;
   }
 };
 
@@ -128,7 +158,6 @@ Use clear markdown when helpful (bullet points, short paragraphs).
       `.trim(),
     };
 
-    // Map your app's roles to OpenAI roles
     const historyMessages = history.map((msg) => ({
       role: msg.role === "user" ? ("user" as const) : ("assistant" as const),
       content: msg.text,
@@ -176,7 +205,6 @@ Use clear markdown when helpful (bullet points, short paragraphs).
 
       buffer += decoder.decode(value, { stream: true });
 
-      // SSE events are separated by a blank line
       const events = buffer.split("\n\n");
       buffer = events.pop() || "";
 
@@ -194,12 +222,10 @@ Use clear markdown when helpful (bullet points, short paragraphs).
 
           try {
             const json = JSON.parse(dataStr);
-
-            // Chat Completions streaming: choices[0].delta.content
             const delta = json?.choices?.[0]?.delta?.content;
             if (delta) onChunk(delta);
           } catch {
-            // Ignore malformed JSON from partial frames (rare with the buffer logic above)
+            // ignore partial frames
           }
         }
       }
